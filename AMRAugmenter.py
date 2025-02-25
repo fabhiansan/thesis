@@ -1,379 +1,410 @@
-# Required imports
+import re 
 import random
 import requests
-import networkx as nx
-import matplotlib.pyplot as plt
 from nltk.corpus import wordnet
+import nltk
+nltk.download('wordnet')
 from penman.graph import Graph
 from penman import Triple
+import traceback
+from penman import decode, encode  # For parsing and encoding AMR graphs
 
-class AMRAugmenter:
-    def __init__(self, source='conceptnet', conceptnet_api="http://api.conceptnet.io"):
-        self.source = source.lower()
-        if self.source not in ['nltk', 'conceptnet']:
-            raise ValueError("Source must be either 'nltk' or 'conceptnet'")
-        self.conceptnet_api = conceptnet_api
-        self.pred_error_prob = 0.3
-        self.entity_error_prob = 0.3
-        # Add new error probabilities
-        self.circumstance_error_prob = 0.3
-        self.discourse_error_prob = 0.3
+class AMRAugmenterDirect:
+    def __init__(self, source='nltk', pred_error_prob=0.3, entity_error_prob=0.3, 
+                 circumstance_error_prob=0.2, discourse_error_prob=0.2):
+        """
+        Initialize the AMR augmenter
         
-        # Define circumstance roles that can be modified
+        Args:
+            source: Source for word alternatives ('nltk', etc.)
+            pred_error_prob: Probability of modifying a predicate
+            entity_error_prob: Probability of modifying an entity
+            circumstance_error_prob: Probability of modifying a circumstance role
+            discourse_error_prob: Probability of modifying a discourse role
+        """
+        self.source = source
+        self.pred_error_prob = pred_error_prob
+        self.entity_error_prob = entity_error_prob
+        self.circumstance_error_prob = circumstance_error_prob
+        self.discourse_error_prob = discourse_error_prob
+        
+        # Set of circumstance roles
         self.circumstance_roles = {
-            ':time', ':location', ':manner', ':duration', 
-            ':instrument', ':purpose', ':source', ':destination'
+            ':time', ':duration', ':instrument', ':location', ':destination',
+            ':path', ':source', ':direction', ':frequency', ':manner'
         }
         
-        # Define discourse roles that can be modified
+        # Set of discourse roles
         self.discourse_roles = {
-            ':cause', ':condition', ':concession', ':consequence',
-            ':temporal-before', ':temporal-after', ':temporal-during'
+            ':topic', ':medium', ':purpose', ':beneficiary', ':concession', 
+            ':condition', ':extent'
+        }
+        
+        # Initialize modifications tracking
+        self.reset_modifications()
+
+    def reset_modifications(self):
+        """Reset the modification tracking"""
+        self.modifications = {
+            'total_nodes': 0,
+            'modified_nodes': 0,
+            'predicate_changes': [],
+            'entity_changes': [],
+            'circumstance_changes': [],
+            'discourse_changes': []
         }
     
     def get_related_words(self, word):
-        """Get related words based on selected source"""
-        if not word or not isinstance(word, str):
+        """Get alternative words (synonyms, etc.) for a given word"""
+        
+        # Skip if word is not a string or is empty
+        if not isinstance(word, str) or not word:
             return []
-            
-        if self.source == 'nltk':
-            return self._get_nltk_related_words(word)
-        return self._get_conceptnet_related_words(word)
-    
-    def _get_nltk_related_words(self, word):
-        """Get related words using NLTK WordNet"""
-        related_words = []
-        try:
-            # Corrected the language parameter for synsets
-            synsets = wordnet.synsets(word, lang='ind')
-            
-            for synset in synsets:
-                # Add lemma names with correct parameter usage
-                related_words.extend([lemma.name() for lemma in synset.lemmas(lang='ind')])
-                # Add hypernyms
-                for hypernym in synset.hypernyms():
-                    related_words.extend([lemma.name() for lemma in hypernym.lemmas(lang='ind')])
-                # Add hyponyms
-                for hyponym in synset.hyponyms():
-                    related_words.extend([lemma.name() for lemma in hyponym.lemmas(lang='ind')])
-            
-            # Remove the original word from related words
-            if word in related_words:
-                related_words.remove(word)
-                
-            return list(set(related_words))
-        except Exception as e:
-            print(f"Error getting NLTK related words: {e}")
+        
+        # Skip numerical values and year patterns
+        if word.isdigit() or re.match(r'^[12]\d{3}$', word):  # Skip years like 2005
             return []
-    
-    def _get_conceptnet_related_words(self, word):
-        """Get related Indonesian words from ConceptNet"""
+        
+        # Skip compound terms with hyphens that aren't predicates
+        if '-' in word and not re.search(r'-\d+$', word):
+            return []
+        
+        # Remove -01, -02 suffix for predicates (common in AMR)
+        predicate_suffix = re.search(r'(-\d+)$', word)
+        base_word = re.sub(r'-\d+$', '', word) if predicate_suffix else word
+        
+        alternatives = []
+        
         try:
-            url = f"{self.conceptnet_api}/c/id/{word}"
-            response = requests.get(url)
-            
-            if response.status_code != 200:
-                print(f"Error from ConceptNet API: {response.status_code}")
-                return []
+            if self.source == 'nltk':
+                # For Indonesian words, ensure we only return Indonesian alternatives
+                # Detect if the word is likely Indonesian
+                is_indonesian = self._is_likely_indonesian(base_word)
                 
-            response_data = response.json()
-            related_words = []
-            
-            for edge in response_data.get('edges', []):
-                # Only extract Indonesian words
-                if 'start' in edge and 'language' in edge['start'] and edge['start']['language'] == 'id':
-                    word_label = edge['start'].get('label', '')
-                    if word_label and word_label != word:
-                        related_words.append(word_label)
+                from nltk.corpus import wordnet as wn
+                synsets = wn.synsets(base_word)
+                
+                # Get lemma names from all synsets
+                for synset in synsets:
+                    for lemma in synset.lemmas():
+                        alt = lemma.name().replace('_', '-')
                         
-                if 'end' in edge and 'language' in edge['end'] and edge['end']['language'] == 'id':
-                    word_label = edge['end'].get('label', '')
-                    if word_label and word_label != word:
-                        related_words.append(word_label)
-                    
-            return list(set(related_words))
+                        # Skip taxonomic/biological classifications that might come from WordNet
+                        if any(term in alt.lower() for term in ['genus', 'species', 'family', 'class']):
+                            continue
+                        
+                        # Skip capitalized terms when original is lowercase (likely proper nouns)
+                        if base_word.islower() and not alt.islower():
+                            continue
+                        
+                        # Only add if it's not the same as original and not too short
+                        if alt != base_word and alt != word and len(alt) > 2:
+                            # For Indonesian words, check if alternative seems Indonesian
+                            if is_indonesian and not self._is_likely_indonesian(alt):
+                                # Skip English alternatives for Indonesian words
+                                continue
+                            
+                            # If original had a numeric suffix (like -01), preserve it
+                            if predicate_suffix and not re.search(r'-\d+$', alt):
+                                alt = alt + predicate_suffix.group(1)
+                            
+                            # Don't add Indonesian affixes to words that already have them
+                            if (is_indonesian and 
+                                (alt.startswith('me') or alt.startswith('ber') or 
+                                 alt.startswith('ter') or alt.startswith('pe') or
+                                 alt.startswith('se') or alt.startswith('ke') or
+                                 alt.startswith('di') or
+                                 alt.endswith('kan') or alt.endswith('an') or
+                                 alt.endswith('i') or alt.endswith('nya') or
+                                 alt.endswith('lah') or alt.endswith('kah'))):
+                                if self._has_indonesian_affixes(base_word):
+                                    # Skip if base already has affixes
+                                    continue
+                            
+                            alternatives.append(alt)
+                            
+            # Add more sources here if needed
+            
+            # Remove duplicates and limit list size
+            return list(set(alternatives))[:5]  # Limit to 5 alternatives
+            
         except Exception as e:
-            print(f"Error getting ConceptNet related words: {e}")
+            print(f"Error in get_related_words: {e}")
             return []
-
-    def introduce_predicate_error(self, amr_graph):
-        """Introduce errors in predicates"""
-        modified_graph = amr_graph.copy()
         
-        for node in modified_graph.nodes():
-            if random.random() < self.pred_error_prob:
-                if 'predicate' in modified_graph.nodes[node]:
-                    current_pred = modified_graph.nodes[node]['predicate']
-                    alternatives = self.get_related_words(current_pred)
-                    if alternatives:  # Only replace if alternatives are found
-                        modified_graph.nodes[node]['predicate'] = random.choice(alternatives)
+    def _has_indonesian_affixes(self, word):
+        """Check if a word already has Indonesian affixes"""
+        prefixes = ['me', 'ber', 'ter', 'pe', 'se', 'ke', 'di']
+        suffixes = ['kan', 'an', 'i', 'nya', 'lah', 'kah']
         
-        return modified_graph
-
-    def introduce_entity_error(self, amr_graph):
-        """Introduce errors in entities"""
-        modified_graph = amr_graph.copy()
-        
-        for node in modified_graph.nodes():
-            if random.random() < self.entity_error_prob:
-                if 'entity' in modified_graph.nodes[node]:
-                    current_entity = modified_graph.nodes[node]['entity']
-                    alternatives = self.get_related_words(current_entity)
-                    if alternatives:  # Only replace if alternatives are found
-                        modified_graph.nodes[node]['entity'] = random.choice(alternatives)
-        
-        return modified_graph
-
-    def introduce_circumstance_error(self, amr_graph):
-        """Introduce errors in circumstantial information (time, location, etc.)"""
-        modified_graph = amr_graph.copy()
-        
-        # Get all edges with circumstance roles
-        circumstance_edges = [(s, t, d) for (s, t, d) in modified_graph.edges(data=True) 
-                             if d.get('role', '') in self.circumstance_roles]
-        
-        if not circumstance_edges:
-            return modified_graph
+        for prefix in prefixes:
+            if word.startswith(prefix) and len(word) > len(prefix) + 2:
+                return True
             
-        for source, target, data in circumstance_edges:
-            if random.random() < self.circumstance_error_prob:
-                role = data.get('role', '')
-                
-                # Strategy 1: Swap with another circumstance of the same type
-                edges_same_role = [(s, t, d) for (s, t, d) in modified_graph.edges(data=True) 
-                                 if d.get('role') == role and (s, t) != (source, target)]
-                
-                if edges_same_role and random.random() < 0.5:
-                    other_source, other_target, _ = random.choice(edges_same_role)
-                    try:
-                        # Swap targets
-                        modified_graph.remove_edge(source, target)
-                        modified_graph.remove_edge(other_source, other_target)
-                        modified_graph.add_edge(source, other_target, role=role)
-                        modified_graph.add_edge(other_source, target, role=role)
-                    except Exception as e:
-                        print(f"Error swapping circumstances: {e}")
-                        # Restore original edges if error occurs
-                        if not modified_graph.has_edge(source, target):
-                            modified_graph.add_edge(source, target, role=role)
-                        if not modified_graph.has_edge(other_source, other_target):
-                            modified_graph.add_edge(other_source, other_target, role=role)
-                
-                # Strategy 2: Change the circumstance type
-                else:
-                    other_roles = list(self.circumstance_roles - {role})
-                    if other_roles:
-                        new_role = random.choice(other_roles)
-                        try:
-                            modified_graph.remove_edge(source, target)
-                            modified_graph.add_edge(source, target, role=new_role)
-                        except Exception as e:
-                            print(f"Error changing circumstance type: {e}")
-                            # Restore original edge if error occurs
-                            if not modified_graph.has_edge(source, target):
-                                modified_graph.add_edge(source, target, role=role)
-
-        return modified_graph
-
-    def introduce_discourse_error(self, amr_graph):
-        """Introduce errors in discourse links between statements"""
-        modified_graph = amr_graph.copy()
-        
-        # Get all edges with discourse roles
-        discourse_edges = [(s, t, d) for (s, t, d) in modified_graph.edges(data=True) 
-                          if d.get('role', '') in self.discourse_roles]
-        
-        if not discourse_edges:
-            return modified_graph
+        for suffix in suffixes:
+            if word.endswith(suffix) and len(word) > len(suffix) + 2:
+                return True
             
-        for source, target, data in discourse_edges:
-            if random.random() < self.discourse_error_prob:
-                current_role = data.get('role', '')
-                
-                # Strategy 1: Change discourse relation type
-                if random.random() < 0.5:
-                    other_roles = list(self.discourse_roles - {current_role})
-                    if other_roles:
-                        new_role = random.choice(other_roles)
-                        try:
-                            modified_graph.remove_edge(source, target)
-                            modified_graph.add_edge(source, target, role=new_role)
-                        except Exception as e:
-                            print(f"Error changing discourse relation type: {e}")
-                            # Restore original edge if error occurs
-                            if not modified_graph.has_edge(source, target):
-                                modified_graph.add_edge(source, target, role=current_role)
-                
-                # Strategy 2: Reverse the direction of the relation
-                else:
-                    try:
-                        modified_graph.remove_edge(source, target)
-                        modified_graph.add_edge(target, source, role=current_role)
-                    except Exception as e:
-                        print(f"Error reversing discourse relation: {e}")
-                        # Restore original edge if error occurs
-                        if not modified_graph.has_edge(source, target):
-                            modified_graph.add_edge(source, target, role=current_role)
-        
-        return modified_graph
+        return False
 
-    def nx_to_penman(self, nx_graph):
-        """Convert NetworkX graph to Penman graph format"""
-        if not nx_graph.nodes():
-            return Graph([])  # Return empty graph if input is empty
-            
-        triples = []
-        instance_triples = []
+    def _is_likely_indonesian(self, word):
+        """Heuristic to check if a word is likely Indonesian"""
+        # Skip hyphenated compounds or words with digits
+        if '-' in word or any(c.isdigit() for c in word):
+            return True  # Treat as Indonesian to be safe
         
-        # First add instance triples
-        for node in nx_graph.nodes():
-            node_data = nx_graph.nodes[node]
-            if 'predicate' in node_data:
-                instance_triples.append(Triple(source=str(node), 
-                                          role=':instance',
-                                          target=node_data['predicate']))
-            elif 'entity' in node_data:
-                instance_triples.append(Triple(source=str(node),
-                                          role=':instance',
-                                          target=node_data['entity']))
-            else:
-                # For nodes without predicate or entity, create a placeholder instance
-                instance_triples.append(Triple(source=str(node),
-                                          role=':instance',
-                                          target='unknown'))
+        # Common Indonesian affixes
+        if self._has_indonesian_affixes(word):
+            return True
         
-        # Then add relation triples
-        for source, target, data in nx_graph.edges(data=True):
-            if 'role' in data:
-                # Ensure role has the correct format (starts with ':')
-                role = data['role']
-                if not role.startswith(':'):
-                    role = f":{role}"
-                triples.append(Triple(source=str(source),
-                                   role=role,
-                                   target=str(target)))
+        # List of common Indonesian words for comparison
+        indonesian_common_words = [
+            'dan', 'yang', 'di', 'itu', 'dengan', 'untuk', 'pada', 'tidak', 
+            'dari', 'dalam', 'akan', 'oleh', 'juga', 'ini', 'sudah', 'saya',
+            'ke', 'bisa', 'ada', 'seperti', 'tahun', 'orang', 'hanya', 'banyak',
+            'lebih', 'kata', 'tapi', 'kami', 'lain', 'dia', 'karena', 'atau',
+            'jika', 'kita', 'tentang', 'sekarang', 'masih', 'lagi', 'telah', 'harus',
+            'mereka', 'kali', 'belum', 'gambar', 'foto', 'nama', 'kota', 'media',
+            'tanggal', 'panas', 'suam', 'lama', 'muncul', 'berbagai', 'utama'
+        ]
         
-        # Combine instance and relation triples
-        all_triples = instance_triples + triples
+        # Check if word is in the Indonesian common word list
+        if word.lower() in indonesian_common_words:
+            return True
         
-        # Create Penman graph
-        return Graph(all_triples)
-
-    def penman_to_nx(self, penman_graph):
-        """Convert Penman graph to NetworkX format"""
-        nx_graph = nx.DiGraph()
+        # Check for characteristic letter patterns (more common in Indonesian)
+        if 'ng' in word or 'ny' in word:
+            return True
         
-        if not penman_graph.triples:
-            return nx_graph  # Return empty graph if input is empty
-        
-        # Process instance triples
-        for triple in penman_graph.instances():
-            node_id = triple.source
-            target = triple.target
-            
-            # Determine if the node is a predicate or entity
-            if target.startswith('pred_'):
-                nx_graph.add_node(node_id, predicate=target[5:])
-            elif target == 'unknown':
-                # Handle placeholder instances
-                nx_graph.add_node(node_id)
-            else:
-                nx_graph.add_node(node_id, entity=target)
-        
-        # Process relation triples
-        for triple in penman_graph.edges():
-            if not triple.role.startswith(':instance'):
-                # Extract role name without ':' prefix
-                role = triple.role[1:] if triple.role.startswith(':') else triple.role
-                nx_graph.add_edge(triple.source, triple.target, role=role)
-        
-        return nx_graph
+        # Default to treating it as Indonesian when in doubt
+        return True
 
     def augment_amr(self, amr_graph):
         """Main function to augment AMR graph with errors"""
         try:
-            # Convert to NetworkX if input is Penman Graph
-            if isinstance(amr_graph, Graph):
-                nx_graph = self.penman_to_nx(amr_graph)
-            else:
-                nx_graph = amr_graph.copy()
-                
-            if not nx_graph.nodes():
-                print("Warning: Empty graph provided for augmentation")
-                return amr_graph
-                
-            # Perform augmentation with all error types
-            modified_graph = self.introduce_predicate_error(nx_graph)
-            modified_graph = self.introduce_entity_error(modified_graph)
-            modified_graph = self.introduce_circumstance_error(modified_graph)
-            modified_graph = self.introduce_discourse_error(modified_graph)
+            # Preserve the original top variable to maintain structure
+            original_top = amr_graph.top
             
-            # Convert back to Penman if input was Penman
-            if isinstance(amr_graph, Graph):
-                return self.nx_to_penman(modified_graph)
-            return modified_graph
+            # Get triples and handle both tuple format and Triple objects
+            triples = list(amr_graph.triples)
+            
+            # Check if we're dealing with tuples or Triple objects
+            is_tuple_format = isinstance(triples[0], tuple) if triples else False
+            
+            # Function to get components consistently regardless of format
+            def get_source(t): return t[0] if is_tuple_format else t.source
+            def get_role(t): return t[1] if is_tuple_format else t.role  
+            def get_target(t): return t[2] if is_tuple_format else t.target
+            def make_triple(s, r, t): return (s, r, t) if is_tuple_format else Triple(s, r, t)
+            
+            self.modifications['total_nodes'] = len(set(get_source(t) for t in triples))
+            
+            # Collect all variables (node identifiers) to prevent modifying them
+            variables = set(get_source(t) for t in triples)
+            for t in triples:
+                if not isinstance(get_target(t), str):
+                    continue
+                # If target is a variable reference, add it to the set
+                if get_target(t) in variables:
+                    variables.add(get_target(t))
+            
+            # Kumpulkan semua node dan instance mereka
+            instances = {}
+            for t in triples:
+                if get_role(t) == ':instance':
+                    instances[get_source(t)] = get_target(t)
+            
+            # Modifikasi predicate (instance)
+            modified_triples = []
+            for t in triples:
+                if get_role(t) == ':instance' and random.random() < self.pred_error_prob:
+                    target = get_target(t)
+                    
+                    # Skip compound terms with hyphens that aren't predicates
+                    if '-' in target and not re.search(r'-\d+$', target):
+                        modified_triples.append(t)
+                        continue
+                    
+                    # Skip if it looks like an entity-date combination
+                    if target.endswith('-tanggal') or target.startswith('entitas-'):
+                        modified_triples.append(t)
+                        continue
+                    
+                    alternatives = self.get_related_words(target)
+                    if alternatives:
+                        new_value = random.choice(alternatives)
+                        modified_triples.append(make_triple(get_source(t), get_role(t), new_value))
+                        self.modifications['predicate_changes'].append({
+                            'node_id': get_source(t),
+                            'old_value': target,
+                            'new_value': new_value
+                        })
+                        self.modifications['modified_nodes'] += 1
+                    else:
+                        modified_triples.append(t)
+                else:
+                    modified_triples.append(t)
+            
+            # Modifikasi entity values - ONLY for string literals, not variables
+            for i, t in enumerate(modified_triples):
+                target = get_target(t)
+                # Skip if not a string, is an instance relation, or is a variable reference
+                if (not isinstance(target, str) or
+                    get_role(t) == ':instance' or
+                    target in variables or
+                    target.isdigit() or  # Skip numerical values
+                    re.match(r'^[12]\d{3}$', target) or  # Skip years
+                    (target.startswith('"') and target.endswith('"')) or  # Skip quoted strings
+                    random.random() >= self.entity_error_prob):
+                    continue
+                    
+                alternatives = self.get_related_words(target)
+                if alternatives:
+                    new_value = random.choice(alternatives)
+                    modified_triples[i] = make_triple(get_source(t), get_role(t), new_value)
+                    self.modifications['entity_changes'].append({
+                        'node_id': get_source(t),
+                        'old_value': target,
+                        'new_value': new_value
+                    })
+                    self.modifications['modified_nodes'] += 1
+            
+            # Modifikasi circumstance roles
+            for i, t in enumerate(modified_triples):
+                if get_role(t) in self.circumstance_roles and random.random() < self.circumstance_error_prob:
+                    other_roles = list(self.circumstance_roles - {get_role(t)})
+                    if other_roles:
+                        new_role = random.choice(other_roles)
+                        modified_triples[i] = make_triple(get_source(t), new_role, get_target(t))
+                        self.modifications['circumstance_changes'].append({
+                            'edge': (get_source(t), get_target(t)),
+                            'old_role': get_role(t),
+                            'new_role': new_role
+                        })
+                        self.modifications['modified_nodes'] += 1
+            
+            # Modifikasi discourse roles
+            for i, t in enumerate(modified_triples):
+                if get_role(t) in self.discourse_roles and random.random() < self.discourse_error_prob:
+                    other_roles = list(self.discourse_roles - {get_role(t)})
+                    if other_roles:
+                        new_role = random.choice(other_roles)
+                        modified_triples[i] = make_triple(get_source(t), new_role, get_target(t))
+                        self.modifications['discourse_changes'].append({
+                            'edge': (get_source(t), get_target(t)),
+                            'old_role': get_role(t),
+                            'new_role': new_role
+                        })
+                        self.modifications['modified_nodes'] += 1
+            
+            # Buat graph baru dengan triples yang dimodifikasi, preserving the original top
+            try:
+                new_graph = Graph(modified_triples, top=original_top)
+                
+                # Test if the graph can be encoded to verify it's valid
+                encode(new_graph)
+                
+                return new_graph
+            except Exception as validation_error:
+                print(f"Generated invalid graph: {validation_error}. Returning original graph.")
+                return amr_graph
             
         except Exception as e:
             print(f"Error in augment_amr: {e}")
+            traceback.print_exc()
             return amr_graph  # Return original graph on error
 
-    def visualize_graph(self, graph, title="AMR Graph"):
-        """Visualize AMR graph with labels"""
-        if not graph or not graph.nodes():
-            print("Cannot visualize empty graph")
-            return None
-            
+    def get_modifications_summary(self):
+        """Get a summary of modifications made in the last augmentation"""
+        if not any([
+            self.modifications['predicate_changes'],
+            self.modifications['entity_changes'],
+            self.modifications['circumstance_changes'],
+            self.modifications['discourse_changes']
+        ]):
+            return "No modifications were made."
+        
+        summary = f"Modified {self.modifications['modified_nodes']} out of {self.modifications['total_nodes']} nodes:\n"
+        
+        if self.modifications['predicate_changes']:
+            summary += "\nPredicate Changes:\n"
+            for change in self.modifications['predicate_changes']:
+                summary += f"- Node {change['node_id']}: '{change['old_value']}' → '{change['new_value']}'\n"
+        
+        if self.modifications['entity_changes']:
+            summary += "\nEntity Changes:\n"
+            for change in self.modifications['entity_changes']:
+                summary += f"- Node {change['node_id']}: '{change['old_value']}' → '{change['new_value']}'\n"
+        
+        if self.modifications['circumstance_changes']:
+            summary += "\nCircumstance Relation Changes:\n"
+            for change in self.modifications['circumstance_changes']:
+                summary += f"- Edge {change['edge']}: '{change['old_role']}' → '{change['new_role']}'\n"
+        
+        if self.modifications['discourse_changes']:
+            summary += "\nDiscourse Relation Changes:\n"
+            for change in self.modifications['discourse_changes']:
+                summary += f"- Edge {change['edge']}: '{change['old_role']}' → '{change['new_role']}'\n"
+        
+        return summary
+
+def test_amr_augmentation():
+    """Test the AMR augmenter with a sample graph"""
+    # Sample AMR graph in Penman notation (Indonesian example)
+    sample_amr = """
+    (z0 / gambar
+       :ARG0 (z1 / ini)
+       :ARG1 (z2 / foto
+               :ARG0 (z3 / lama-01))
+       :ARG1 (z4 / muncul-01
+               :ARG0 (z5 / orang
+                       :ARG0-of (z6 / tua-01))
+               :lokasi (z7 / berbagai
+                         :ARG1 (z8 / tempat)))
+       :ARG1 (z9 / dan
+               :op1 (z10 / nama
+                      :poss (z11 / mereka)
+                      :mod (z12 / "Hong"))
+               :op2 (z13 / tanggal)))
+    """
+    
+    # Parse the AMR graph
+    try:
+        graph = decode(sample_amr)
+        print("Original AMR Graph:")
+        print(encode(graph, indent=2))
+        
+        # Initialize the augmenter
+        augmenter = AMRAugmenterDirect(
+            pred_error_prob=0.8,  # Higher probability for testing
+            entity_error_prob=0.8,
+            circumstance_error_prob=0.8,
+            discourse_error_prob=0.8
+        )
+        
+        # Apply augmentation
+        augmented_graph = augmenter.augment_amr(graph)
+        
+        # Print the result
+        print("\nAugmented AMR Graph:")
+        print(encode(augmented_graph, indent=2))
+        
+        # Show modifications summary
+        print("\nModifications Summary:")
+        print(augmenter.get_modifications_summary())
+        
+        # Verify the graph is valid
         try:
-            plt.figure(figsize=(12, 8))
-            
-            # Use a better layout algorithm for complex graphs
-            if len(graph.nodes()) > 20:
-                pos = nx.kamada_kawai_layout(graph)
-            else:
-                pos = nx.spring_layout(graph, k=0.3, iterations=50)
-            
-            # Draw nodes
-            nx.draw_networkx_nodes(graph, pos, node_color='lightblue', 
-                                node_size=2000, alpha=0.7)
-            
-            # Create node labels
-            node_labels = {}
-            for node in graph.nodes():
-                label_parts = []
-                node_data = graph.nodes[node]
-                if 'predicate' in node_data:
-                    label_parts.append(f"pred: {node_data['predicate']}")
-                if 'entity' in node_data:
-                    label_parts.append(f"ent: {node_data['entity']}")
-                if not label_parts:
-                    label_parts.append(f"node: {node}")
-                    
-                node_labels[node] = '\n'.join(label_parts)
-            
-            # Draw edge labels with better positioning
-            edge_labels = {(s, t): d.get('role', '') for s, t, d in graph.edges(data=True)}
-            nx.draw_networkx_edge_labels(graph, pos, edge_labels=edge_labels, font_size=8)
-            
-            # Draw edges
-            nx.draw_networkx_edges(graph, pos, edge_color='gray', arrows=True, 
-                                arrowsize=20, width=1.5)
-            
-            # Draw labels
-            nx.draw_networkx_labels(graph, pos, node_labels, font_size=10)
-            
-            plt.title(title)
-            plt.axis('off')
-            
-            return plt
-            
+            encode(augmented_graph)
+            print("\nGraph validation: PASSED")
         except Exception as e:
-            print(f"Error in visualize_graph: {e}")
-            return None
-            
-    def __str__(self):
-        """String representation of the augmenter"""
-        return (f"AMRAugmenter(source={self.source}, "
-                f"pred_error_prob={self.pred_error_prob}, "
-                f"entity_error_prob={self.entity_error_prob}, "
-                f"circumstance_error_prob={self.circumstance_error_prob}, "
-                f"discourse_error_prob={self.discourse_error_prob})")
+            print(f"\nGraph validation: FAILED - {e}")
+        
+    except Exception as e:
+        print(f"Error in test: {e}")
+        traceback.print_exc()
+
+# Run the test if the script is executed directly
+if __name__ == "__main__":
+    print("Testing AMR Augmenter...")
+    test_amr_augmentation()
