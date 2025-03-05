@@ -1,8 +1,11 @@
+import os
 import penman
 from tqdm import tqdm
 import torch
 from transformers import T5TokenizerFast, AutoModelForSeq2SeqLM
+from utils.utils import make_no_metadata_graph, to_amr_with_pointer
 
+T5_PREFIX = "translate English to Indonesian: "
 
 class AMRToTextBase:
     def __call__(self, graphs: list[penman.Graph]) -> list[str]:
