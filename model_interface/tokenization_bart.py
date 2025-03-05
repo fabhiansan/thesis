@@ -65,6 +65,7 @@ class AMRBartTokenizer(MBart50Tokenizer):
         self.amr_bos_token_id = self.vocab[self.amr_bos_token]
         self.amr_eos_token = "</AMR>"
         self.amr_eos_token_id = self.vocab[self.amr_eos_token]
+        print(f"Added {self.modified} AMR tokens")
 
     def _tokenize(self, text):
         """ Tokenize a string. Modified in order to handle sentences with recategorization pointers"""
@@ -126,9 +127,11 @@ class AMRBartTokenizer(MBart50Tokenizer):
                 elif is_rel:
                     bpe_toks = [self.INIT + ':'] + self._tok_bpe(tokk[1:])
                 else:
-                    raise NotImplementedError(
-                        f"Cannot handle for this case:\ntok:{tokk}, is_rel:{is_rel}, is_spc:{is_spc}, is_frame:{is_frame}, is_of:{is_of}"
-                    )
+                    print("tok:", tokk)
+                    print(
+                        f"is_rel:{is_rel}, is_spc:{is_spc}, is_frame:{is_frame}, is_of:{is_of}")
+                    exit()
+                    raise
             else:
                 if is_in_enc:
                     bpe_toks = [self.INIT + tokk]
@@ -170,13 +173,7 @@ class AMRBartTokenizer(MBart50Tokenizer):
                 # print('nodes', nodes, file=sys.stderr)
                 # print('backreferences', backreferences, file=sys.stderr)
                 # print('graph', graph, file=sys.stderr)
-
-            if isinstance(graph, penman.Graph) and len(graph.triples) > 0 and graph.triples[0][0] is not None:
-                return graph, status, (nodes, backreferences)
-            else:
-                print("Empty AMR failure!", file=sys.stderr)
-                return postprocessing.BACKOFF, postprocessing.ParsedStatus.BACKOFF, (None, None)
-            
+            return graph, status, (nodes, backreferences)
         except Exception as e:
             print('Reconnection 2 failure', file=sys.stderr)
             print(get_traceback(e), file=sys.stderr)
@@ -252,7 +249,6 @@ class AMRBartTokenizer(MBart50Tokenizer):
 
         i = 0
         nodes_ = []
-        last = None
         while i < (len(nodes) - 1):
             if nodes[i] == ':':
                 nodes_.append(nodes[i] + nodes[i+1])
@@ -262,7 +258,6 @@ class AMRBartTokenizer(MBart50Tokenizer):
                 nodes_.append(nodes[i])
                 i += 1
                 last = True
-
         if last:
             nodes_.append(nodes[-1])
         nodes = nodes_
@@ -320,7 +315,7 @@ class AMRBartTokenizer(MBart50Tokenizer):
         pieces_ = []
         open_cnt = 0
         closed_cnt = 0
-        if len(nodes) == 0 or nodes[0] != '(':
+        if nodes[0] != '(':
             pieces_.append('(')
             open_cnt += 1
         for p in nodes:

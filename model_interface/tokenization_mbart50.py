@@ -127,7 +127,28 @@ class MBart50Tokenizer(PreTrainedTokenizer):
         sp_model_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> None:
+        # Mask token behave like a normal word, i.e. include the space before it
+        mask_token = AddedToken(mask_token, lstrip=True, rstrip=False) if isinstance(mask_token, str) else mask_token
+
         self.sp_model_kwargs = {} if sp_model_kwargs is None else sp_model_kwargs
+
+        kwargs["additional_special_tokens"] = kwargs.get("additional_special_tokens", [])
+        kwargs["additional_special_tokens"] += [
+            code for code in FAIRSEQ_LANGUAGE_CODES if code not in kwargs["additional_special_tokens"]
+        ]
+
+        super().__init__(
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            eos_token=eos_token,
+            unk_token=unk_token,
+            sep_token=sep_token,
+            cls_token=cls_token,
+            pad_token=pad_token,
+            mask_token=mask_token,
+            sp_model_kwargs=self.sp_model_kwargs,
+            **kwargs,
+        )
 
         self.sp_model = spm.SentencePieceProcessor(**self.sp_model_kwargs)
         self.sp_model.Load(str(vocab_file))
@@ -157,32 +178,8 @@ class MBart50Tokenizer(PreTrainedTokenizer):
 
         self._src_lang = src_lang if src_lang is not None else "en_XX"
         self.cur_lang_code_id = self.lang_code_to_id[self._src_lang]
-        self.tgt_lang = tgt_lang if tgt_lang is not None else "en_XX"
-
-        # Mask token behave like a normal word, i.e. include the space before it
-        mask_token = AddedToken(mask_token, lstrip=True, rstrip=False) if isinstance(mask_token, str) else mask_token
-
-        kwargs["additional_special_tokens"] = kwargs.get("additional_special_tokens", [])
-        kwargs["additional_special_tokens"] += [
-            code for code in FAIRSEQ_LANGUAGE_CODES if code not in kwargs["additional_special_tokens"]
-        ]
-
-        super().__init__(
-            src_lang=src_lang,
-            tgt_lang=tgt_lang,
-            eos_token=eos_token,
-            unk_token=unk_token,
-            sep_token=sep_token,
-            cls_token=cls_token,
-            pad_token=pad_token,
-            mask_token=mask_token,
-            sp_model_kwargs=self.sp_model_kwargs,
-            **kwargs,
-        )
-
+        self.tgt_lang = tgt_lang
         self.set_src_lang_special_tokens(self._src_lang)
-
-        self.sp_unk_token_id = self.sp_model.PieceToId("<unk>")
 
     @property
     def vocab_size(self) -> int:
@@ -225,9 +222,6 @@ class MBart50Tokenizer(PreTrainedTokenizer):
         if token in self.fairseq_tokens_to_ids:
             return self.fairseq_tokens_to_ids[token]
         spm_id = self.sp_model.PieceToId(token)
-
-        if spm_id == self.sp_unk_token_id:
-            return self.fairseq_tokens_to_ids["<unk>"]
 
         # Need to return unknown token if the SP model returned 0
         return spm_id + self.fairseq_offset if spm_id else self.unk_token_id
