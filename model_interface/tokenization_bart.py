@@ -67,6 +67,11 @@ class AMRBartTokenizer(MBart50Tokenizer):
         self.amr_eos_token_id = self.vocab[self.amr_eos_token]
         print(f"Added {self.modified} AMR tokens")
 
+    @property
+    def vocab_size(self):
+        # Make sure to define the vocab_size property that's expected from the parent class
+        return len(self.get_vocab())
+
     def _tokenize(self, text):
         """ Tokenize a string. Modified in order to handle sentences with recategorization pointers"""
         bpe_tokens = []
